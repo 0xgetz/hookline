@@ -1,7 +1,4 @@
-"""xAI OAuth device-code grant (Grok CLI / CPA client).
-
-Endpoints from https://auth.x.ai/.well-known/openid-configuration
-"""
+"""xAI OAuth 设备码授权（Grok CLI / CPA 客户端）。"""
 
 from __future__ import annotations
 
@@ -217,7 +214,6 @@ def poll_device_token(
     log = log or _noop_log
     deadline = time.time() + max(expires_in - 5, 30)
     sleep_for = max(interval, 1)
-    fast_poll_remaining = 3
     net_streak = 0
     max_net_streak = 20
     while time.time() < deadline:
@@ -274,10 +270,8 @@ def poll_device_token(
             if err == "slow_down":
                 sleep_for = min(sleep_for + 5, 30)
             log(f"oauth poll: {err} (sleep {sleep_for}s)")
-            actual_sleep = 2 if fast_poll_remaining > 0 else sleep_for
-            if fast_poll_remaining > 0:
-                fast_poll_remaining -= 1
-            time.sleep(actual_sleep)
+            # 严格遵守设备授权端点返回的轮询间隔，避免设备码因请求过快被作废。
+            time.sleep(sleep_for)
             continue
         if err in ("expired_token", "access_denied"):
             raise OAuthDeviceError(f"device auth failed: {err}: {desc}")

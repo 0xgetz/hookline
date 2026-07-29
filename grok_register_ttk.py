@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -80,6 +80,8 @@ DEFAULT_CONFIG = {
     "browser_restart_every": 10,
     "cpa_probe_after_write": False,
     "cpa_mint_async": True,
+    "browser_path": "",
+    "browser_headless": False,
     "browser_use_custom_ua": False,
     "log_level": "info",
     "speed_log_interval_sec": 60,
@@ -91,6 +93,7 @@ _cf_domain_lock = threading.Lock()
 _io_lock = threading.Lock()
 _stats_lock = threading.Lock()
 _cpa_threads_lock = threading.Lock()
+_browser_profile_cleanup_lock = threading.Lock()
 
 _LOG_LEVEL_RANK = {
     "quiet": 10,
@@ -687,6 +690,90 @@ def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, pag
         return {"ok": False, "error": str(exc)}
 
 
+def cleanup_browser_profiles(profile_path=None, stale_only=False, log_callback=None):
+    """删除指定浏览器 profile，或清理所属进程已退出的遗留 profile。"""
+    import shutil
+    import socket
+    import tempfile
+
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".browser_profiles")
+    )
+    project_auto_root = os.path.join(project_root, "autoPortData")
+    legacy_auto_root = os.path.abspath(
+        os.path.join(tempfile.gettempdir(), "DrissionPage", "autoPortData")
+    )
+    legacy_temp_root = os.path.dirname(legacy_auto_root)
+    allowed_roots = (project_root, legacy_auto_root)
+    deleted = []
+    with _browser_profile_cleanup_lock:
+        candidates = []
+        if profile_path:
+            candidates.append(os.path.abspath(str(profile_path)))
+        elif stale_only:
+            try:
+                import psutil
+
+                if os.path.isdir(project_root):
+                    for name in os.listdir(project_root):
+                        candidate = os.path.abspath(os.path.join(project_root, name))
+                        match = re.fullmatch(r"w\d+_(\d+)_\d+_\d+", name)
+                        owner_pid = int(match.group(1)) if match else None
+                        if os.path.isdir(candidate) and match and not psutil.pid_exists(owner_pid):
+                            candidates.append(candidate)
+
+                # 兼容 DrissionPage auto_port 产生的端口目录；保留近期或端口仍在使用的目录。
+                for auto_root in (project_auto_root, legacy_auto_root):
+                    if not os.path.isdir(auto_root):
+                        continue
+                    for name in os.listdir(auto_root):
+                        candidate = os.path.abspath(os.path.join(auto_root, name))
+                        if not (name.isdigit() and os.path.isdir(candidate)):
+                            continue
+                        if time.time() - os.path.getmtime(candidate) < 60:
+                            continue
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                            probe.settimeout(0.1)
+                            if probe.connect_ex(("127.0.0.1", int(name))) != 0:
+                                candidates.append(candidate)
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 扫描遗留浏览器资料目录失败: {exc}")
+
+        for candidate in candidates:
+            try:
+                allowed = any(
+                    candidate != root and os.path.commonpath([root, candidate]) == root
+                    for root in allowed_roots
+                )
+                if not allowed:
+                    continue
+            except ValueError:
+                continue
+            for attempt in range(5):
+                if not os.path.exists(candidate):
+                    deleted.append(candidate)
+                    break
+                try:
+                    shutil.rmtree(candidate)
+                except OSError:
+                    if attempt < 4:
+                        time.sleep(0.2 * (attempt + 1))
+                else:
+                    deleted.append(candidate)
+                    break
+
+        for empty_dir in (project_auto_root, project_root, legacy_auto_root, legacy_temp_root):
+            try:
+                os.rmdir(empty_dir)
+            except OSError:
+                pass
+
+    if log_callback and deleted:
+        log_callback(f"[Debug] 已清理浏览器临时资料目录: {len(deleted)} 个")
+    return deleted
+
+
 def create_browser_options():
     """创建尽量贴近真实浏览器的启动参数。
 
@@ -695,25 +782,53 @@ def create_browser_options():
     """
     options = ChromiumOptions()
     options.set_timeouts(base=1)
-    # 并发时为每个 worker 分配独立资料目录，避免 cookie/会话互相污染
+    # auto_port 会为每个 worker 分配端口目录，临时根目录固定在项目内便于可靠清理。
     profile_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".browser_profiles")
     try:
         os.makedirs(profile_root, exist_ok=True)
-        wid = _get_worker_id()
-        profile_dir = os.path.join(
-            profile_root,
-            f"w{wid}_{os.getpid()}_{threading.get_ident()}_{int(time.time() * 1000) % 1000000}",
-        )
-        options.set_user_data_path(profile_dir)
+        options.set_tmp_path(profile_root)
     except Exception:
         pass
-    # set_user_data_path 可能清掉 auto_port，必须放在后面重新启用
     options.auto_port()
     for flag in (
         "--no-first-run",
         "--no-default-browser-check",
     ):
         options.set_argument(flag)
+    if config.get("browser_headless", False):
+        try:
+            options.headless(True)
+        except Exception:
+            options.set_argument("--headless=new")
+        # 无头模式下部分第三方资源可能长期挂起，只等待 DOMContentLoaded 即可进入后续元素检测。
+        options.set_load_mode("eager")
+    browser_path = str(config.get("browser_path", "") or "").strip().strip('"')
+    browser_candidates = []
+    if browser_path:
+        browser_candidates.append(browser_path)
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    browser_candidates.extend(
+        [
+            os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(local_app_data, "Microsoft", "Edge", "Application", "msedge.exe"),
+        ]
+    )
+    seen_browser_paths = set()
+    for candidate in browser_candidates:
+        candidate = os.path.expandvars(os.path.expanduser(str(candidate or "").strip()))
+        normalized = os.path.normcase(os.path.abspath(candidate)) if candidate else ""
+        if not normalized or normalized in seen_browser_paths:
+            continue
+        seen_browser_paths.add(normalized)
+        if os.path.isfile(candidate):
+            options.set_browser_path(candidate)
+            break
     # 仅显式配置 proxy 时写入；TUN 模式保持空
     proxy = str(config.get("proxy", "") or "").strip()
     if proxy:
@@ -1531,35 +1646,167 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
-def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
+# 开启 NSFW 时从浏览器复用的 CF / 会话相关 cookie 名
+_NSFW_BROWSER_COOKIE_NAMES = (
+    "cf_clearance",
+    "__cf_bm",
+    "__cfruid",
+    "_cfuvid",
+    "cf_chl_rc_i",
+    "cf_chl_2",
+)
+
+
+def get_browser_nsfw_cookies(page=None, log_callback=None):
+    """从注册浏览器提取可用于 NSFW 请求的 cookie（含 cf_clearance）。"""
+    result = {}
+    try:
+        if page is None:
+            try:
+                page = _get_page()
+            except Exception:
+                page = None
+        if page is None:
+            return result
+        cookies = page.cookies(all_domains=True, all_info=True) or []
+        for item in cookies:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                value = str(item.get("value", "")).strip()
+                domain = str(item.get("domain", "") or item.get("host", "") or "").lower()
+            else:
+                name = str(getattr(item, "name", "")).strip()
+                value = str(getattr(item, "value", "")).strip()
+                domain = str(getattr(item, "domain", "") or getattr(item, "host", "") or "").lower()
+            if not name or not value:
+                continue
+            if name not in _NSFW_BROWSER_COOKIE_NAMES and name not in ("sso", "sso-rw"):
+                continue
+            # 优先保留 grok.com / x.ai 相关域；已有值时仅用更匹配域名覆盖
+            preferred = bool(domain) and ("grok" in domain or "x.ai" in domain)
+            if name in result and not preferred:
+                continue
+            result[name] = value
+        if log_callback:
+            has_cf = bool(result.get("cf_clearance"))
+            extra = [k for k in result if k not in ("sso", "sso-rw", "cf_clearance")]
+            log_callback(
+                f"[Debug] NSFW 浏览器 cookie: cf_clearance={'有' if has_cf else '无'}"
+                + (f", 其它={extra}" if extra else "")
+            )
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[Debug] 提取浏览器 cookie 失败: {e}")
+    return result
+
+
+def _build_nsfw_cookie_header(token, cf_clearance="", extra_cookies=None):
+    cookie_map = {}
+    if isinstance(extra_cookies, dict):
+        for k, v in extra_cookies.items():
+            k = str(k or "").strip()
+            v = str(v or "").strip()
+            if k and v:
+                cookie_map[k] = v
+    token = str(token or "").strip()
+    if token:
+        cookie_map["sso"] = token
+        cookie_map["sso-rw"] = token
+    cf_clearance = str(cf_clearance or "").strip()
+    if cf_clearance:
+        cookie_map["cf_clearance"] = cf_clearance
+    return "; ".join(f"{k}={v}" for k, v in cookie_map.items())
+
+
+def _nsfw_attempt_once(cookie_header, user_agent, proxies, log_callback=None):
+    with requests.Session(impersonate="chrome120", proxies=proxies) as session:
+        session.headers.update(
+            {
+                "user-agent": user_agent,
+                "cookie": cookie_header,
+                "accept": "*/*",
+                "accept-language": "en-US,en;q=0.9",
+                "sec-ch-ua": '"Chromium";v="120", "Not(A:Brand";v="24", "Google Chrome";v="120"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-site",
+            }
+        )
+        ok, message = set_tos_accepted(session, log_callback)
+        if not ok:
+            return False, message
+        ok, message = set_birth_date(session, log_callback)
+        if not ok:
+            return False, message
+        ok, message = update_nsfw_settings(session, log_callback)
+        if not ok:
+            return False, message
+        return True, "成功开启 NSFW"
+
+
+def enable_nsfw_for_token(
+    token,
+    cf_clearance="",
+    log_callback=None,
+    extra_cookies=None,
+    max_retries=2,
+):
+    """用 SSO + 浏览器 CF cookie 开启 NSFW；CF 拦截时自动重试。"""
     proxies = get_proxies()
     user_agent = get_user_agent()
-    try:
-        with requests.Session(impersonate="chrome120", proxies=proxies) as session:
-            cookie_parts = [f"sso={token}", f"sso-rw={token}"]
-            if cf_clearance:
-                cookie_parts.append(f"cf_clearance={cf_clearance}")
-            session.headers.update(
-                {
-                    "user-agent": user_agent,
-                    "cookie": "; ".join(cookie_parts),
-                }
+    # 若调用方未传 extra_cookies，尝试从当前浏览器抓
+    if extra_cookies is None:
+        extra_cookies = get_browser_nsfw_cookies(log_callback=log_callback)
+    if not cf_clearance and isinstance(extra_cookies, dict):
+        cf_clearance = str(extra_cookies.get("cf_clearance", "") or "").strip()
+    cookie_header = _build_nsfw_cookie_header(token, cf_clearance, extra_cookies)
+    retries = max(1, int(max_retries or 1))
+    last_message = "未知错误"
+    for attempt in range(1, retries + 1):
+        try:
+            if log_callback and attempt > 1:
+                log_callback(f"[*] NSFW 第 {attempt}/{retries} 次重试...")
+            elif log_callback:
+                has_cf = "cf_clearance=" in cookie_header
+                log_callback(
+                    f"[Debug] NSFW 请求 cookie 已就绪 (cf_clearance={'有' if has_cf else '无'})"
+                )
+            ok, message = _nsfw_attempt_once(
+                cookie_header, user_agent, proxies, log_callback
             )
-            ok, message = set_tos_accepted(session, log_callback)
-            if not ok:
-                return False, message
-            ok, message = set_birth_date(session, log_callback)
-            if not ok:
-                return False, message
-            ok, message = update_nsfw_settings(session, log_callback)
-            if not ok:
-                return False, message
-            return True, "成功开启 NSFW"
-    except Exception as e:
-        return False, f"异常: {str(e)}"
+            if ok:
+                return True, message
+            last_message = message
+            # 仅对 Cloudflare / 瞬时错误重试
+            retryable = (
+                "Cloudflare" in str(message)
+                or "HTTP 403" in str(message)
+                or "HTTP 429" in str(message)
+                or "HTTP 503" in str(message)
+                or "异常" in str(message)
+            )
+            if not retryable or attempt >= retries:
+                break
+            # 重试前重新抓一次浏览器 cookie（可能已刷新）
+            refreshed = get_browser_nsfw_cookies(log_callback=log_callback)
+            if refreshed:
+                extra_cookies = refreshed
+                if not str(cf_clearance or "").strip():
+                    cf_clearance = str(refreshed.get("cf_clearance", "") or "").strip()
+                cookie_header = _build_nsfw_cookie_header(token, cf_clearance, extra_cookies)
+            time.sleep(1.5 * attempt)
+        except Exception as e:
+            last_message = f"异常: {str(e)}"
+            if attempt >= retries:
+                break
+            time.sleep(1.5 * attempt)
+    return False, last_message
 
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+SIGNUP_PAGE_LOAD_TIMEOUT = 20
 
 _tls = threading.local()
 _cpa_async_threads: list = []
@@ -1743,14 +1990,20 @@ def tk_option_menu(parent, variable, values, width=12):
 
 
 def start_browser(log_callback=None):
+    cleanup_browser_profiles(stale_only=True, log_callback=log_callback)
     last_exc = None
     for attempt in range(1, 5):
+        browser_options = None
         try:
-            _set_browser(Chromium(create_browser_options()))
+            browser_options = create_browser_options()
+            _set_browser(Chromium(browser_options))
+            _tls.browser_profile_path = getattr(_get_browser(), "user_data_path", None)
             tabs = _get_browser().get_tabs()
             _set_page(tabs[-1] if tabs else _get_browser().new_tab())
             if log_callback and getattr(_get_browser(), "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {_get_browser().user_data_path}")
+            if log_callback and config.get("browser_headless", False):
+                log_callback("[*] 注册浏览器已启用无头模式（Cloudflare 拦截概率可能升高）")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return _get_browser(), _get_page()
@@ -1763,6 +2016,12 @@ def start_browser(log_callback=None):
                     _get_browser().quit(del_data=True)
             except Exception:
                 pass
+            failed_profile = getattr(browser_options, "user_data_path", None)
+            cleanup_browser_profiles(
+                profile_path=failed_profile or getattr(_tls, "browser_profile_path", None),
+                log_callback=log_callback,
+            )
+            _tls.browser_profile_path = None
             _set_browser(None)
             _set_page(None)
             time.sleep(min(1.5 * attempt, 4))
@@ -1770,31 +2029,21 @@ def start_browser(log_callback=None):
 
 
 def stop_browser():
-    profile_path = None
+    profile_path = getattr(_tls, "browser_profile_path", None)
     browser = _get_browser()
     if browser is not None:
         try:
-            profile_path = getattr(browser, "user_data_path", None)
+            profile_path = getattr(browser, "user_data_path", None) or profile_path
         except Exception:
-            profile_path = None
+            pass
         try:
             browser.quit(del_data=True)
         except Exception:
             pass
     _set_browser(None)
     _set_page(None)
-    if profile_path:
-        try:
-            import shutil
-
-            root = os.path.abspath(
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), ".browser_profiles")
-            )
-            abs_profile = os.path.abspath(str(profile_path))
-            if abs_profile.startswith(root) and os.path.isdir(abs_profile):
-                shutil.rmtree(abs_profile, ignore_errors=True)
-        except Exception:
-            pass
+    cleanup_browser_profiles(profile_path=profile_path)
+    _tls.browser_profile_path = None
 
 
 def restart_browser(log_callback=None):
@@ -2069,11 +2318,44 @@ return {
         return {"url": "none", "title": "", "buttons": [], "body": "", "hasEmail": False}
 
 
+def _browser_error_detail(page):
+    """识别 Chromium/Edge 内部网络错误页，返回可读诊断信息。"""
+    if page is None:
+        return "浏览器页面不存在"
+    try:
+        url = str(getattr(page, "url", "") or "")
+    except Exception:
+        url = ""
+    low_url = url.lower()
+    internal_error = any(
+        marker in low_url
+        for marker in ("chrome-error://", "chromewebdata", "edge-error://", "about:neterror")
+    )
+    if not internal_error:
+        return ""
+    try:
+        title = str(getattr(page, "title", "") or "")
+    except Exception:
+        title = ""
+    try:
+        html = str(getattr(page, "html", "") or "")[:5000]
+    except Exception:
+        html = ""
+    error_match = re.search(r"\bERR_[A-Z0-9_]+\b", html, re.IGNORECASE)
+    error_code = error_match.group(0).upper() if error_match else "未知网络错误"
+    return f"url={url or 'unknown'}; error={error_code}; title={title or 'none'}"
+
+
 def click_email_signup_button(timeout=18, log_callback=None, cancel_callback=None):
     deadline = time.time() + timeout
     last_diag = 0.0
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        browser_error = _browser_error_detail(_get_page())
+        if browser_error:
+            raise AccountRetryNeeded(
+                f"注册页发生浏览器网络错误，请检查 config.proxy 或 TUN 网络，重试当前账号: {browser_error}"
+            )
         blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
         if blocked:
             raise Exception(f"Cloudflare 拦截页，无法点击邮箱注册: {detail}")
@@ -2116,8 +2398,17 @@ def click_email_signup_button(timeout=18, log_callback=None, cancel_callback=Non
         try:
             url_now = (_get_page().url if _get_page() else "") or ""
             if "about:blank" in url_now or not url_now:
-                _get_page().get(SIGNUP_URL)
-                _get_page().wait.doc_loaded()
+                loaded = _get_page().get(
+                    SIGNUP_URL,
+                    retry=0,
+                    timeout=SIGNUP_PAGE_LOAD_TIMEOUT,
+                )
+                if loaded is False:
+                    raise AccountRetryNeeded(
+                        "注册页加载超时，请检查 config.proxy 或 TUN 网络，重试当前账号"
+                    )
+        except AccountRetryNeeded:
+            raise
         except Exception:
             pass
         sleep_with_cancel(0.8, cancel_callback)
@@ -2125,6 +2416,11 @@ def click_email_signup_button(timeout=18, log_callback=None, cancel_callback=Non
     blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
     if blocked:
         raise Exception(f"Cloudflare 拦截页，无法点击邮箱注册: {detail}")
+    browser_error = _browser_error_detail(_get_page())
+    if browser_error:
+        raise AccountRetryNeeded(
+            f"注册页发生浏览器网络错误，请检查 config.proxy 或 TUN 网络，重试当前账号: {browser_error}"
+        )
     snap = _signup_page_snapshot(log_callback)
     if log_callback:
         log_callback(
@@ -2168,10 +2464,20 @@ def open_signup_page(log_callback=None, cancel_callback=None):
                 _set_page(tabs[0] if tabs else browser.new_tab())
             except Exception:
                 _set_page(browser.new_tab())
-            _get_page().get(SIGNUP_URL)
-            _get_page().wait.doc_loaded()
+            loaded = _get_page().get(
+                SIGNUP_URL,
+                retry=0,
+                timeout=SIGNUP_PAGE_LOAD_TIMEOUT,
+            )
+            if loaded is False:
+                raise TimeoutError(
+                    f"注册页在 {SIGNUP_PAGE_LOAD_TIMEOUT} 秒内未加载完成，请检查 config.proxy 或 TUN 网络"
+                )
             # 给 CF/前端一点渲染时间
             sleep_with_cancel(1.2, cancel_callback)
+            browser_error = _browser_error_detail(_get_page())
+            if browser_error:
+                raise ConnectionError(f"浏览器网络错误: {browser_error}")
             blocked, detail = detect_cloudflare_block_page(log_callback=log_callback)
             if blocked:
                 last_exc = Exception(f"Cloudflare 拦截页: {detail}")
@@ -2188,7 +2494,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         except Exception as e:
             last_exc = e
             if log_callback:
-                log_callback(f"[Debug] 打开注册页失败(第{attempt}/3次): {e}")
+                log_callback(f"[!] 打开注册页失败，重启浏览器重试 ({attempt}/3): {e}")
             try:
                 restart_browser(log_callback=log_callback)
             except Exception as e2:
@@ -2196,7 +2502,7 @@ def open_signup_page(log_callback=None, cancel_callback=None):
                     log_callback(f"[Debug] 重启浏览器失败: {e2}")
             sleep_with_cancel(1, cancel_callback)
     if not opened:
-        raise Exception(f"打开注册页失败: {last_exc}")
+        raise AccountRetryNeeded(f"打开注册页失败，重试当前账号: {last_exc}")
 
     _deadline = time.time() + 10
     while time.time() < _deadline:
@@ -2206,6 +2512,11 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             if log_callback:
                 log_callback(f"[!] 注册页加载后仍是 Cloudflare 拦截页: {detail}")
             raise Exception(f"Cloudflare 拦截页: {detail}")
+        browser_error = _browser_error_detail(_get_page())
+        if browser_error:
+            raise AccountRetryNeeded(
+                f"注册页发生浏览器网络错误，请检查 config.proxy 或 TUN 网络，重试当前账号: {browser_error}"
+            )
         try:
             _ready = _get_page().run_js(
                 "return !!document.querySelector('button, input[type=\"email\"], a[href*=\"sign\"], a[href*=\"email\"], form')"
@@ -3258,6 +3569,18 @@ class GrokRegisterGUI:
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
         add_field(self.grok2api_remote_key_entry, 9, 1, columnspan=3)
 
+        add_label(10, 0, "浏览器路径:")
+        self.browser_path_var = tk.StringVar(value=str(config.get("browser_path", "")))
+        self.browser_path_entry = tk_entry(config_frame, textvariable=self.browser_path_var, width=34)
+        add_field(self.browser_path_entry, 10, 1)
+
+        add_label(10, 2, "浏览器模式:")
+        self.browser_headless_var = tk.BooleanVar(value=bool(config.get("browser_headless", False)))
+        self.browser_headless_check = tk_checkbutton(
+            config_frame, text="无头注册", variable=self.browser_headless_var
+        )
+        add_field(self.browser_headless_check, 10, 3, sticky=tk.W)
+
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
@@ -3359,6 +3682,8 @@ class GrokRegisterGUI:
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
+        config["browser_path"] = self.browser_path_var.get().strip()
+        config["browser_headless"] = bool(self.browser_headless_var.get())
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -3611,7 +3936,14 @@ class GrokRegisterGUI:
                     log_fn(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
         if config.get("enable_nsfw", True):
             log_fn("[*] 6. 开启 NSFW")
-            nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log_fn)
+            nsfw_cookies = get_browser_nsfw_cookies(page=_cpa_page, log_callback=log_fn)
+            nsfw_ok, nsfw_msg = enable_nsfw_for_token(
+                sso,
+                cf_clearance=str(nsfw_cookies.get("cf_clearance", "") or ""),
+                log_callback=log_fn,
+                extra_cookies=nsfw_cookies,
+                max_retries=3,
+            )
             if nsfw_ok:
                 log_fn(f"[+] NSFW 开启成功: {nsfw_msg}")
             else:
@@ -3838,7 +4170,14 @@ def _register_one_account_cli(log_fn, stop_fn, accounts_output_file):
                 log_fn(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
     if config.get("enable_nsfw", True):
         log_fn("[*] 6. 开启 NSFW")
-        nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log_fn)
+        nsfw_cookies = get_browser_nsfw_cookies(page=_cpa_page, log_callback=log_fn)
+        nsfw_ok, nsfw_msg = enable_nsfw_for_token(
+            sso,
+            cf_clearance=str(nsfw_cookies.get("cf_clearance", "") or ""),
+            log_callback=log_fn,
+            extra_cookies=nsfw_cookies,
+            max_retries=3,
+        )
         if nsfw_ok:
             log_fn(f"[+] NSFW 开启成功: {nsfw_msg}")
         else:

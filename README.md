@@ -48,7 +48,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 
 - 支持 GUI 图形界面运行。
 - 支持 CLI 终端运行，不启动 Tk GUI。
-- 注册流程使用 Chromium/Chrome 浏览器页面完成。
+- 注册流程使用 Chromium/Chrome 完成，支持可配置的无头注册。
 - 支持多 worker 并发注册（`concurrent_count`），每个 worker 独立浏览器与隔离 profile。
 - 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口。
 - 支持验证码邮件轮询和解析。
@@ -113,6 +113,7 @@ cp config.example.json config.json
 | `grok2api_remote_app_key` | 远端 grok2api app key |
 | `concurrent_count` | 并发 worker 数；`1` 为单浏览器顺序注册，`>1` 为多浏览器并发 |
 | `browser_restart_every` | 额外周期重启提示间隔（账号数）；**每个账号结束后仍会完整重启浏览器**，避免会话残留 |
+| `browser_headless` | 是否使用无头浏览器注册，默认 `false`；启用后无需显示浏览器窗口，但更容易触发 Cloudflare 拦截 |
 | `cpa_export_enabled` | 是否在注册成功后导出 CPA xAI 凭证 |
 | `cpa_mint_async` | 是否异步 mint CPA（默认 `true`：独立浏览器 + 后台线程，不阻塞下一号注册） |
 | `cpa_probe_after_write` | 写出 CPA 文件后是否探测接口可用性 |
@@ -200,7 +201,7 @@ python cf_mail_debug.py --api-base "https://你的-worker-api-域名" --auth-mod
 
 ### CLI 模式
 
-CLI 模式不会启动 Tk GUI，但注册流程仍会打开 Chromium/Chrome 浏览器页面。
+CLI 模式不会启动 Tk GUI。默认仍会打开 Chromium/Chrome 浏览器窗口；将 `browser_headless` 设为 `true` 可隐藏窗口运行。
 
 ```bash
 python grok_register_ttk.py cli
@@ -246,7 +247,7 @@ GUI 模式会打开 Tkinter 窗口，适合手动调整配置和观察日志。�
 - `accounts_*.txt`：成功账号、密码和 SSO token。
 - `mail_credentials.txt`：临时邮箱凭证。
 - `cpa_auths/`：CPA xAI 凭证 JSON（开启 `cpa_export_enabled` 时）。
-- `.browser_profiles/`：并发 worker 临时浏览器 profile（运行中生成，已 gitignore）。
+- `.browser_profiles/`：并发 worker 临时浏览器 profile（运行中生成，浏览器停止后自动删除，已 gitignore）。
 - `*.log`：可选日志文件。
 
 这些文件包含敏感信息，已被 `.gitignore` 忽略。
@@ -255,6 +256,7 @@ GUI 模式会打开 Tkinter 窗口，适合手动调整配置和观察日志。�
 
 - **每个账号结束后完整重启浏览器**（`restart_browser`），避免复用上号 SSO / 落到 `tos-gate` 等错误页。
 - 并发 worker 使用独立 Chromium 与隔离 user-data 目录。
+- 浏览器停止、启动失败时立即清理本次临时 profile，下次启动还会清理异常退出遗留的 profile。
 - 默认 CPA 异步 mint 使用独立浏览器（`page=None`），不占用注册 tab。
 - Cloudflare 拦截页检测与打开注册页重试。
 - 每成功 5 个账号执行一次内存清理。
@@ -272,6 +274,10 @@ CLI 模式只是不启动 Tk GUI。注册页、Turnstile、验证码提交和 SS
 ### 并发时前几个成功、后面提示找不到「使用邮箱注册」？
 
 常见原因是账号间会话残留（例如页面落到 `grok.com/tos-gate`）。当前版本在每个账号结束后都会完整重启浏览器；请确认使用最新代码，且不要改回「仅轻量清 cookie、不重启」。
+
+### 无头模式出现 `chrome-error://chromewebdata/` 或注册页加载超时？
+
+这是浏览器网络错误，不是注册按钮改版。请先确认本机可以访问 `accounts.x.ai` 和 `grok.com`，并检查 TUN 路由；非 TUN 模式需在 `config.json` 的 `proxy` 中填写实际可用的代理地址。程序会快速重启浏览器并重试当前账号，不再将该错误记作按钮不存在。
 
 ### NSFW 开启失败怎么办？
 

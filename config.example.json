@@ -49,6 +49,8 @@
   "concurrent_count": 1,
   "browser_restart_every": 10,
   "cpa_mint_async": true,
+  "browser_path": "",
+  "browser_headless": false,
   "browser_use_custom_ua": false,
   "log_level": "info",
   "speed_log_interval_sec": 60

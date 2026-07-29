@@ -250,12 +250,28 @@ def create_standalone_page(
             log(f"chromium start attempt {_attempt+1}/3 failed: {e}")
             if _attempt < 2:
                 _sleep(3.0)
+    try:
+        from grok_register_ttk import cleanup_browser_profiles  # type: ignore
+
+        cleanup_browser_profiles(
+            profile_path=getattr(opts, "user_data_path", None),
+            log_callback=log,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"清理浏览器临时资料目录失败: {e}")
     raise BrowserConfirmError("chromium failed to start after 3 attempts")
 
 
 def close_standalone(browser: Any) -> None:
+    profile_path = getattr(browser, "user_data_path", None)
     try:
         browser.quit()
+    except Exception:
+        pass
+    try:
+        from grok_register_ttk import cleanup_browser_profiles  # type: ignore
+
+        cleanup_browser_profiles(profile_path=profile_path)
     except Exception:
         pass
 
@@ -315,8 +331,7 @@ def clear_page_session(page: Any, browser: Any | None = None, log: LogFn | None 
 def normalize_cookies(cookies: Any) -> list[dict[str, Any]]:
     """Normalize DrissionPage / browser cookie list to settable dicts.
 
-    Also clones SSO-like cookies onto accounts.x.ai / auth.x.ai domains so
-    device-auth can skip secondary login when possible.
+    同时将 SSO 类 Cookie 复制到 accounts.x.ai 和 auth.x.ai，尽量避免设备授权时重复登录。
     """
     out: list[dict[str, Any]] = []
     if not cookies:

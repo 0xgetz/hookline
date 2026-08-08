@@ -1,27 +1,19 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-.venv/
-venv/
-env/
+# dependencies
+node_modules/
 
-accounts_*.txt
-mail_credentials.txt
-*.txt
-!requirements.txt
+# build output
+dist/
+dist-ssr/
 
-cpa_auths/
-screenshots/
+# env files (Freebuff manages secrets via API Keys)
+.env
+.env.*
+!.env.example
 
-config.json
-config.local.json
+# convex local runtime
+convex-local/
+.local/
 
+# logs & misc
 *.log
 .DS_Store
-.idea/
-.vscode/
-DrissionPage/
-autoPortData/
-.browser_profiles/
